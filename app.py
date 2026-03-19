@@ -57,6 +57,8 @@ BATCH_SESSION = {
     "cancel_requested": False,
     "running": False,
 }
+DRIVE_MOUNT_POINT = "/content/drive"
+DRIVE_DEFAULT_ROOT = "/content/drive/MyDrive"
 
 
 class BatchCancelled(Exception):
@@ -593,6 +595,87 @@ def _normalize_output_folder_path(path_value: str) -> str:
 
     os.makedirs(output_folder, exist_ok=True)
     return output_folder
+
+
+def _is_colab_runtime() -> bool:
+    return os.path.exists("/content") or bool(os.getenv("COLAB_RELEASE_TAG"))
+
+
+def _list_child_folders(base_path: str, max_items: int = 300) -> List[str]:
+    if not base_path or not os.path.isdir(base_path):
+        return []
+
+    folders = []
+    try:
+        with os.scandir(base_path) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    folders.append(entry.path)
+    except OSError:
+        return []
+
+    folders.sort(key=lambda value: value.lower())
+    if len(folders) > max_items:
+        folders = folders[:max_items]
+    return [base_path] + folders
+
+
+def _resolve_drive_base(base_path: Optional[str]) -> str:
+    requested = (base_path or "").strip()
+    if requested and os.path.isdir(requested):
+        return requested
+    if os.path.isdir(DRIVE_DEFAULT_ROOT):
+        return DRIVE_DEFAULT_ROOT
+    return DRIVE_MOUNT_POINT
+
+
+def connect_google_drive(base_path):
+    if not _is_colab_runtime():
+        status = "Google Drive connect is only available in Google Colab runtime."
+        return status, gr.update(choices=[], value=None), base_path, gr.update()
+
+    try:
+        from google.colab import drive as colab_drive
+    except Exception as exc:
+        status = f"Cannot import google.colab drive API: {exc}"
+        return status, gr.update(choices=[], value=None), base_path, gr.update()
+
+    try:
+        if not os.path.isdir(DRIVE_DEFAULT_ROOT):
+            colab_drive.mount(DRIVE_MOUNT_POINT, force_remount=False)
+    except Exception as exc:
+        status = f"Drive mount failed: {exc}"
+        return status, gr.update(choices=[], value=None), base_path, gr.update()
+
+    resolved_base = _resolve_drive_base(base_path)
+    choices = _list_child_folders(resolved_base)
+    selected = choices[0] if choices else resolved_base
+    status = f"Drive connected. Browse folders under {resolved_base} and click 'Use Selected Folder'."
+    return status, gr.update(choices=choices, value=selected), resolved_base, selected
+
+
+def refresh_drive_folders(base_path):
+    resolved_base = _resolve_drive_base(base_path)
+    if not os.path.isdir(resolved_base):
+        status = f"Drive base path does not exist: {resolved_base}"
+        return status, gr.update(choices=[], value=None), resolved_base
+
+    choices = _list_child_folders(resolved_base)
+    selected = choices[0] if choices else resolved_base
+    status = f"Loaded {max(len(choices) - 1, 0)} subfolders from {resolved_base}."
+    return status, gr.update(choices=choices, value=selected), resolved_base
+
+
+def use_selected_drive_folder(selected_folder):
+    if not selected_folder or not str(selected_folder).strip():
+        return gr.update(), "Select a Drive folder first."
+
+    try:
+        output_folder = _normalize_output_folder_path(str(selected_folder))
+    except Exception as exc:
+        return gr.update(), f"Invalid Drive folder: {exc}"
+
+    return output_folder, f"Output folder set to Drive path: {output_folder}"
 
 
 def _get_batch_paths(output_folder: str) -> Dict[str, str]:
@@ -1479,6 +1562,26 @@ def build_ui():
 
                 with gr.Group():
                     gr.Markdown("### Batch Controls & Output Setup")
+                    drive_status = gr.Textbox(
+                        label="Drive Connection",
+                        interactive=False,
+                        value="Drive not connected yet.",
+                    )
+                    drive_base_path = gr.Textbox(
+                        label="Drive Browser Base Path",
+                        value=DRIVE_DEFAULT_ROOT,
+                        placeholder="/content/drive/MyDrive",
+                    )
+                    with gr.Row():
+                        connect_drive_btn = gr.Button("Connect Google Drive")
+                        refresh_drive_btn = gr.Button("Refresh Folders")
+                    drive_folder_dropdown = gr.Dropdown(
+                        label="Drive Folder",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                    )
+                    use_drive_folder_btn = gr.Button("Use Selected Folder")
                     batch_output_folder = gr.Textbox(
                         label="Output Folder Path",
                         placeholder="/content/drive/MyDrive/MyAudioFolder",
@@ -1503,6 +1606,27 @@ def build_ui():
                     load_batch_script,
                     inputs=[batch_script_upload],
                     outputs=[batch_table, batch_status],
+                    queue=False,
+                )
+
+                connect_drive_btn.click(
+                    connect_google_drive,
+                    inputs=[drive_base_path],
+                    outputs=[drive_status, drive_folder_dropdown, drive_base_path, batch_output_folder],
+                    queue=False,
+                )
+
+                refresh_drive_btn.click(
+                    refresh_drive_folders,
+                    inputs=[drive_base_path],
+                    outputs=[drive_status, drive_folder_dropdown, drive_base_path],
+                    queue=False,
+                )
+
+                use_drive_folder_btn.click(
+                    use_selected_drive_folder,
+                    inputs=[drive_folder_dropdown],
+                    outputs=[batch_output_folder, batch_status],
                     queue=False,
                 )
 
