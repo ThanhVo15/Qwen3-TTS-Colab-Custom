@@ -1,4 +1,6 @@
 qwen-tts
+pandas
+openpyxl
 pysrt
 sentencex
 faster-whisper==1.1.1

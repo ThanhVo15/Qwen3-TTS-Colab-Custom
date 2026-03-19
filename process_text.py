@@ -211,7 +211,7 @@ def get_tts_file_name(text, language="en"):
 # ==================================================
 
 def text_chunk(text, language="English", char_limit=280):
-    lang_code=LANGUAGE_CODE.get('English',"en")
+    lang_code = LANGUAGE_CODE.get(language, LANGUAGE_CODE.get("English", "en"))
 
     # text = clean_text(text) #because Qwen3-TTS can handle that
 
