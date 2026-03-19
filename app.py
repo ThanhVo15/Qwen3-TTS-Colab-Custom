@@ -1,6 +1,7 @@
 # %cd /content/Qwen3-TTS-Colab
 import csv
 import gc
+import io
 import json
 import os
 import re
@@ -629,10 +630,21 @@ def _resolve_drive_base(base_path: Optional[str]) -> str:
     return DRIVE_MOUNT_POINT
 
 
+def _is_drive_mounted() -> bool:
+    return os.path.isdir(DRIVE_DEFAULT_ROOT)
+
+
 def connect_google_drive(base_path):
     if not _is_colab_runtime():
         status = "Google Drive connect is only available in Google Colab runtime."
         return status, gr.update(choices=[], value=None), base_path, gr.update()
+
+    if _is_drive_mounted():
+        resolved_base = _resolve_drive_base(base_path)
+        choices = _list_child_folders(resolved_base)
+        selected = choices[0] if choices else resolved_base
+        status = f"Drive already mounted. Browse folders under {resolved_base} and click 'Use Selected Folder'."
+        return status, gr.update(choices=choices, value=selected), resolved_base, selected
 
     try:
         from google.colab import drive as colab_drive
@@ -644,7 +656,16 @@ def connect_google_drive(base_path):
         if not os.path.isdir(DRIVE_DEFAULT_ROOT):
             colab_drive.mount(DRIVE_MOUNT_POINT, force_remount=False)
     except Exception as exc:
-        status = f"Drive mount failed: {exc}"
+        exc_text = str(exc)
+        if "kernel" in exc_text.lower() or "nonetype" in exc_text.lower():
+            status = (
+                "Drive mount from app subprocess failed. In Colab, mount Drive in a notebook cell first:\n"
+                "from google.colab import drive\n"
+                "drive.mount('/content/drive')\n"
+                "Then come back and click 'Refresh Folders'."
+            )
+        else:
+            status = f"Drive mount failed: {exc}"
         return status, gr.update(choices=[], value=None), base_path, gr.update()
 
     resolved_base = _resolve_drive_base(base_path)
@@ -655,6 +676,15 @@ def connect_google_drive(base_path):
 
 
 def refresh_drive_folders(base_path):
+    if not _is_drive_mounted():
+        status = (
+            "Drive is not mounted yet. In Colab run:\n"
+            "from google.colab import drive\n"
+            "drive.mount('/content/drive')\n"
+            "Then click 'Refresh Folders'."
+        )
+        return status, gr.update(choices=[], value=None), _resolve_drive_base(base_path)
+
     resolved_base = _resolve_drive_base(base_path)
     if not os.path.isdir(resolved_base):
         status = f"Drive base path does not exist: {resolved_base}"
@@ -870,24 +900,13 @@ def _load_state_file(output_folder: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
-def _load_script_rows(file_path: str):
-    if not file_path:
-        raise ValueError("Upload a CSV or XLSX file first.")
-
-    extension = os.path.splitext(file_path)[1].lower()
-    if extension == ".csv":
-        dataframe = pd.read_csv(file_path)
-    elif extension == ".xlsx":
-        dataframe = pd.read_excel(file_path)
-    else:
-        raise ValueError("Unsupported file type. Use .csv or .xlsx")
-
+def _rows_from_dataframe(dataframe: pd.DataFrame):
     if dataframe.empty:
-        raise ValueError("The uploaded file is empty.")
+        raise ValueError("The script source is empty.")
 
     normalized_columns = {str(column).strip().lower(): column for column in dataframe.columns}
     if "script" not in normalized_columns:
-        raise ValueError("The uploaded file must contain a 'script' column.")
+        raise ValueError("The script source must contain a 'script' column.")
 
     working_df = dataframe.copy()
     if "order" in normalized_columns:
@@ -932,6 +951,43 @@ def _load_script_rows(file_path: str):
     return rows
 
 
+def _load_script_rows(file_path: str):
+    if not file_path:
+        raise ValueError("Upload a CSV or XLSX file first.")
+
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension == ".csv":
+        dataframe = pd.read_csv(file_path)
+    elif extension == ".xlsx":
+        dataframe = pd.read_excel(file_path)
+    else:
+        raise ValueError("Unsupported file type. Use .csv or .xlsx")
+
+    return _rows_from_dataframe(dataframe)
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return stripped
+
+    lines = stripped.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _load_script_rows_from_text(csv_text: str):
+    normalized_text = _strip_code_fence(csv_text)
+    if not normalized_text:
+        raise ValueError("Paste CSV text first.")
+
+    dataframe = pd.read_csv(io.StringIO(normalized_text), skipinitialspace=True)
+    return _rows_from_dataframe(dataframe)
+
+
 def load_batch_script(file_path):
     try:
         rows = _load_script_rows(file_path)
@@ -943,6 +999,19 @@ def load_batch_script(file_path):
     BATCH_SESSION["rows"] = [dict(row) for row in rows]
     BATCH_SESSION["source_file"] = file_path
     return _rows_to_table_value(rows), f"Loaded {len(rows)} script rows from {os.path.basename(file_path)}."
+
+
+def load_batch_script_from_text(csv_text):
+    try:
+        rows = _load_script_rows_from_text(csv_text)
+    except Exception as exc:
+        BATCH_SESSION["rows"] = []
+        BATCH_SESSION["source_file"] = None
+        return [], f"Pasted text parse failed: {exc}"
+
+    BATCH_SESSION["rows"] = [dict(row) for row in rows]
+    BATCH_SESSION["source_file"] = "pasted_csv_text"
+    return _rows_to_table_value(rows), f"Loaded {len(rows)} script rows from pasted CSV text."
 
 
 def build_and_cache_batch_prompt(ref_audio, ref_text, language, model_size, output_folder):
@@ -1549,6 +1618,12 @@ def build_ui():
                         file_types=[".csv", ".xlsx"],
                         type="filepath",
                     )
+                    batch_csv_text_input = gr.Textbox(
+                        label="Or Paste CSV Text",
+                        lines=14,
+                        placeholder="Paste CSV content here. Each line is one row, values separated by commas.",
+                    )
+                    batch_parse_text_btn = gr.Button("Parse Pasted CSV Text")
                     batch_table = gr.Dataframe(
                         headers=BATCH_TABLE_HEADERS,
                         datatype=["number", "str", "str", "str"],
@@ -1605,6 +1680,13 @@ def build_ui():
                 batch_script_upload.change(
                     load_batch_script,
                     inputs=[batch_script_upload],
+                    outputs=[batch_table, batch_status],
+                    queue=False,
+                )
+
+                batch_parse_text_btn.click(
+                    load_batch_script_from_text,
+                    inputs=[batch_csv_text_input],
                     outputs=[batch_table, batch_status],
                     queue=False,
                 )
