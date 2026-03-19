@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,9 @@ BATCH_MANIFEST_HEADERS = [
     "status",
     "language",
     "chunks",
+    "row_elapsed_seconds",
+    "total_elapsed_seconds",
+    "total_elapsed_minutes",
     "output_path",
     "message",
 ]
@@ -822,6 +826,46 @@ def _summarize_batch(rows: List[Dict[str, Any]], queue_row_indices: List[int]) -
     return f"Summary: {success} success, {failed} failed, {skipped} skipped."
 
 
+def _count_processed_rows(rows: List[Dict[str, Any]], queue_row_indices: List[int]) -> int:
+    queue_set = set(queue_row_indices)
+    processed = 0
+    for row in rows:
+        if row["row_index"] not in queue_set:
+            continue
+        if _row_is_final(row):
+            processed += 1
+    return processed
+
+
+def _format_elapsed_minutes(elapsed_seconds: float) -> str:
+    return f"{(max(elapsed_seconds, 0.0) / 60.0):.2f}"
+
+
+def _default_time_displays():
+    return "0.00 min", "ETA: waiting for first completed row"
+
+
+def _build_eta_display(
+    elapsed_seconds: float,
+    processed_rows: int,
+    total_rows: int,
+) -> str:
+    if total_rows <= 0:
+        return "ETA: n/a"
+    if processed_rows <= 0:
+        return "ETA: calculating..."
+    if processed_rows >= total_rows:
+        return "ETA: completed"
+
+    avg_row_seconds = elapsed_seconds / processed_rows
+    remaining_rows = max(total_rows - processed_rows, 0)
+    remaining_seconds = avg_row_seconds * remaining_rows
+    return (
+        f"ETA: {_format_elapsed_minutes(remaining_seconds)} min "
+        f"(processed {processed_rows}/{total_rows})"
+    )
+
+
 def _serialize_rows_for_state(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     serialized = []
     for row in rows:
@@ -842,9 +886,20 @@ def _serialize_rows_for_state(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return serialized
 
 
-def _write_manifest_row(output_folder: str, row: Dict[str, Any]):
+def _write_manifest_row(
+    output_folder: str,
+    row: Dict[str, Any],
+    run_started_epoch: Optional[float] = None,
+    row_elapsed_seconds: Optional[float] = None,
+):
     manifest_path = _get_batch_paths(output_folder)["manifest"]
     file_exists = os.path.exists(manifest_path)
+    total_elapsed_seconds = None
+    total_elapsed_minutes = None
+    if run_started_epoch is not None:
+        total_elapsed_seconds = max(time.time() - float(run_started_epoch), 0.0)
+        total_elapsed_minutes = _format_elapsed_minutes(total_elapsed_seconds)
+
     with open(manifest_path, "a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=BATCH_MANIFEST_HEADERS)
         if not file_exists:
@@ -857,6 +912,13 @@ def _write_manifest_row(output_folder: str, row: Dict[str, Any]):
                 "status": row.get("status", ""),
                 "language": row.get("resolved_language", row.get("language") or ""),
                 "chunks": row.get("chunks", 0),
+                "row_elapsed_seconds": (
+                    f"{max(float(row_elapsed_seconds), 0.0):.3f}" if row_elapsed_seconds is not None else ""
+                ),
+                "total_elapsed_seconds": (
+                    f"{max(float(total_elapsed_seconds), 0.0):.3f}" if total_elapsed_seconds is not None else ""
+                ),
+                "total_elapsed_minutes": total_elapsed_minutes or "",
                 "output_path": row.get("output_path") or "",
                 "message": row.get("note") or row.get("error") or "",
             }
@@ -873,8 +935,25 @@ def _write_state_file(
     default_language: str,
     model_size: str,
     run_mode: str,
+    run_started_epoch: Optional[float] = None,
 ):
     state_path = _get_batch_paths(output_folder)["state"]
+    elapsed_seconds = None
+    elapsed_minutes = None
+    estimated_total_seconds = None
+    estimated_remaining_seconds = None
+    avg_row_seconds = None
+    processed_rows = _count_processed_rows(rows, queue_row_indices)
+    total_rows = len(queue_row_indices)
+
+    if run_started_epoch is not None:
+        elapsed_seconds = max(time.time() - float(run_started_epoch), 0.0)
+        elapsed_minutes = _format_elapsed_minutes(elapsed_seconds)
+        if processed_rows > 0:
+            avg_row_seconds = elapsed_seconds / processed_rows
+            estimated_total_seconds = avg_row_seconds * total_rows
+            estimated_remaining_seconds = max(estimated_total_seconds - elapsed_seconds, 0.0)
+
     payload = {
         "updated_at": _utc_now(),
         "output_folder": output_folder,
@@ -887,6 +966,25 @@ def _write_state_file(
         "prompt_meta": prompt_meta or {},
         "rows": _serialize_rows_for_state(rows),
         "summary": _summarize_batch(rows, queue_row_indices),
+        "run_started_epoch": run_started_epoch,
+        "run_started_at_utc": (
+            datetime.utcfromtimestamp(float(run_started_epoch)).replace(microsecond=0).isoformat() + "Z"
+            if run_started_epoch is not None
+            else None
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_minutes": elapsed_minutes,
+        "processed_rows": processed_rows,
+        "total_rows": total_rows,
+        "avg_row_seconds": avg_row_seconds,
+        "estimated_total_seconds": estimated_total_seconds,
+        "estimated_total_minutes": (
+            _format_elapsed_minutes(estimated_total_seconds) if estimated_total_seconds is not None else None
+        ),
+        "estimated_remaining_seconds": estimated_remaining_seconds,
+        "estimated_remaining_minutes": (
+            _format_elapsed_minutes(estimated_remaining_seconds) if estimated_remaining_seconds is not None else None
+        ),
     }
     with open(state_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -1166,6 +1264,7 @@ def _run_batch_generator(
     model_size: str,
     run_mode: str,
     next_queue_position: int = 0,
+    run_started_epoch: Optional[float] = None,
 ):
     if not queue_row_indices:
         raise ValueError("There are no rows available to process.")
@@ -1179,9 +1278,32 @@ def _run_batch_generator(
     rows_by_index = {row["row_index"]: row for row in rows}
     prompt_status = _format_prompt_status(prompt_meta, prompt_persisted=True)
     source_file = BATCH_SESSION.get("source_file")
+    if run_started_epoch is None:
+        run_started_epoch = time.time()
+
+    def _time_outputs():
+        elapsed_seconds = max(time.time() - float(run_started_epoch), 0.0)
+        elapsed_display = f"{_format_elapsed_minutes(elapsed_seconds)} min"
+        processed_rows = _count_processed_rows(rows, queue_row_indices)
+        eta_display = _build_eta_display(
+            elapsed_seconds=elapsed_seconds,
+            processed_rows=processed_rows,
+            total_rows=len(queue_row_indices),
+        )
+        return elapsed_display, eta_display
+
+    def _emit(status_text: str):
+        elapsed_display, eta_display = _time_outputs()
+        return _rows_to_table_value(rows), status_text, prompt_status, elapsed_display, eta_display
 
     try:
-        yield _rows_to_table_value(rows), f"Batch ready. Processing {len(queue_row_indices)} rows into {output_folder}", prompt_status
+        initial_elapsed = max(time.time() - float(run_started_epoch), 0.0)
+        yield _emit(
+            (
+                f"Batch ready. Processing {len(queue_row_indices)} rows into {output_folder}. "
+                f"Elapsed: {_format_elapsed_minutes(initial_elapsed)} min"
+            )
+        )
 
         cursor = next_queue_position
         while cursor < len(queue_row_indices):
@@ -1196,8 +1318,10 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), "Batch paused before starting the next row.", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Batch paused before starting the next row. Elapsed: {_format_elapsed_minutes(elapsed)} min")
                 return
 
             row_index = queue_row_indices[cursor]
@@ -1212,6 +1336,7 @@ def _run_batch_generator(
                 default_language,
                 model_size,
                 run_mode,
+                run_started_epoch=run_started_epoch,
             )
 
             if not row.get("enabled", True):
@@ -1219,7 +1344,7 @@ def _run_batch_generator(
                 row["error"] = None
                 row["chunks"] = 0
                 row["note"] = "Row disabled by input file."
-                _write_manifest_row(output_folder, row)
+                _write_manifest_row(output_folder, row, run_started_epoch=run_started_epoch, row_elapsed_seconds=0.0)
                 cursor += 1
                 _write_state_file(
                     output_folder,
@@ -1231,8 +1356,10 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), f"Skipped row {row_index}: disabled.", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Skipped row {row_index}: disabled. Elapsed: {_format_elapsed_minutes(elapsed)} min")
                 continue
 
             if not row.get("script"):
@@ -1240,7 +1367,7 @@ def _run_batch_generator(
                 row["error"] = None
                 row["chunks"] = 0
                 row["note"] = "Row has no script text."
-                _write_manifest_row(output_folder, row)
+                _write_manifest_row(output_folder, row, run_started_epoch=run_started_epoch, row_elapsed_seconds=0.0)
                 cursor += 1
                 _write_state_file(
                     output_folder,
@@ -1252,14 +1379,18 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), f"Skipped row {row_index}: empty script.", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Skipped row {row_index}: empty script. Elapsed: {_format_elapsed_minutes(elapsed)} min")
                 continue
 
             row["status"] = "Running"
-            yield _rows_to_table_value(rows), f"Generating row {cursor + 1}/{len(queue_row_indices)} -> {row['filename']}", prompt_status
+            elapsed = max(time.time() - float(run_started_epoch), 0.0)
+            yield _emit(f"Generating row {cursor + 1}/{len(queue_row_indices)} -> {row['filename']} | Elapsed: {_format_elapsed_minutes(elapsed)} min")
 
             try:
+                row_started_epoch = time.time()
                 output_path, chunk_count, note, resolved_language = _generate_batch_audio_for_row(
                     row=row,
                     prompt_items=prompt_items,
@@ -1267,6 +1398,7 @@ def _run_batch_generator(
                     default_language=default_language,
                     output_folder=output_folder,
                 )
+                row_elapsed_seconds = max(time.time() - row_started_epoch, 0.0)
                 row["status"] = "Success"
                 row["resolved_language"] = resolved_language
                 row["output_path"] = output_path
@@ -1274,7 +1406,12 @@ def _run_batch_generator(
                 row["error"] = None
                 row["note"] = note
                 cursor += 1
-                _write_manifest_row(output_folder, row)
+                _write_manifest_row(
+                    output_folder,
+                    row,
+                    run_started_epoch=run_started_epoch,
+                    row_elapsed_seconds=row_elapsed_seconds,
+                )
                 _write_state_file(
                     output_folder,
                     rows,
@@ -1285,8 +1422,10 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), f"Saved {row['filename']} ({cursor}/{len(queue_row_indices)}).", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Saved {row['filename']} ({cursor}/{len(queue_row_indices)}). Row: {row_elapsed_seconds:.1f}s | Elapsed: {_format_elapsed_minutes(elapsed)} min")
             except BatchCancelled:
                 row["status"] = "Pending"
                 row["note"] = "Cancelled before row completion."
@@ -1300,17 +1439,25 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), f"Batch paused. Resume will restart from row {row_index}.", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Batch paused. Resume will restart from row {row_index}. Elapsed: {_format_elapsed_minutes(elapsed)} min")
                 return
             except Exception as exc:
+                row_elapsed_seconds = max(time.time() - row_started_epoch, 0.0) if "row_started_epoch" in locals() else None
                 row["status"] = "Failed"
                 row["output_path"] = None
                 row["chunks"] = 0
                 row["error"] = str(exc)
                 row["note"] = "Generation failed."
                 cursor += 1
-                _write_manifest_row(output_folder, row)
+                _write_manifest_row(
+                    output_folder,
+                    row,
+                    run_started_epoch=run_started_epoch,
+                    row_elapsed_seconds=row_elapsed_seconds,
+                )
                 _write_state_file(
                     output_folder,
                     rows,
@@ -1321,10 +1468,13 @@ def _run_batch_generator(
                     default_language,
                     model_size,
                     run_mode,
+                    run_started_epoch=run_started_epoch,
                 )
-                yield _rows_to_table_value(rows), f"Row {row_index} failed: {exc}", prompt_status
+                elapsed = max(time.time() - float(run_started_epoch), 0.0)
+                yield _emit(f"Row {row_index} failed: {exc} | Elapsed: {_format_elapsed_minutes(elapsed)} min")
 
-        yield _rows_to_table_value(rows), f"Batch finished. {_summarize_batch(rows, queue_row_indices)}", prompt_status
+        elapsed = max(time.time() - float(run_started_epoch), 0.0)
+        yield _emit(f"Batch finished. {_summarize_batch(rows, queue_row_indices)} | Total elapsed: {_format_elapsed_minutes(elapsed)} min")
     finally:
         BATCH_SESSION["running"] = False
         BATCH_SESSION["cancel_requested"] = False
@@ -1332,6 +1482,7 @@ def _run_batch_generator(
 
 
 def generate_all_batch_rows(table_value, output_folder, default_language, model_size, ref_audio, ref_text):
+    run_started_epoch = time.time()
     try:
         normalized_output = _normalize_output_folder_path(output_folder)
         rows = _build_run_rows(table_value, reset_for_new_run=True)
@@ -1353,9 +1504,11 @@ def generate_all_batch_rows(table_value, output_folder, default_language, model_
             default_language,
             model_size,
             "all",
+            run_started_epoch=run_started_epoch,
         )
     except Exception as exc:
-        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Batch start failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta"))
+        elapsed_display, eta_display = _default_time_displays()
+        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Batch start failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta")), elapsed_display, eta_display
         return
 
     yield from _run_batch_generator(
@@ -1368,10 +1521,12 @@ def generate_all_batch_rows(table_value, output_folder, default_language, model_
         model_size=model_size,
         run_mode="all",
         next_queue_position=0,
+        run_started_epoch=run_started_epoch,
     )
 
 
 def generate_selected_batch_rows(table_value, output_folder, default_language, model_size, ref_audio, ref_text, selection_text):
+    run_started_epoch = time.time()
     try:
         normalized_output = _normalize_output_folder_path(output_folder)
         rows = _build_run_rows(table_value, reset_for_new_run=True)
@@ -1394,9 +1549,11 @@ def generate_selected_batch_rows(table_value, output_folder, default_language, m
             default_language,
             model_size,
             "selected",
+            run_started_epoch=run_started_epoch,
         )
     except Exception as exc:
-        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Batch start failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta"))
+        elapsed_display, eta_display = _default_time_displays()
+        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Batch start failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta")), elapsed_display, eta_display
         return
 
     yield from _run_batch_generator(
@@ -1409,6 +1566,7 @@ def generate_selected_batch_rows(table_value, output_folder, default_language, m
         model_size=model_size,
         run_mode="selected",
         next_queue_position=0,
+        run_started_epoch=run_started_epoch,
     )
 
 
@@ -1425,11 +1583,13 @@ def resume_batch_from_checkpoint(output_folder):
         next_queue_position = int(state.get("next_queue_position", 0))
         default_language = state.get("default_language", "Auto")
         model_size = state.get("model_size", "1.7B")
+        run_started_epoch = state.get("run_started_epoch", time.time())
 
         BATCH_SESSION["source_file"] = state.get("source_file")
         BATCH_SESSION["rows"] = [dict(row) for row in rows]
     except Exception as exc:
-        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Resume failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta"))
+        elapsed_display, eta_display = _default_time_displays()
+        yield _rows_to_table_value(BATCH_SESSION["rows"]), f"Resume failed: {exc}", _format_prompt_status(BATCH_SESSION.get("prompt_meta")), elapsed_display, eta_display
         return
 
     yield from _run_batch_generator(
@@ -1442,6 +1602,7 @@ def resume_batch_from_checkpoint(output_folder):
         model_size=model_size,
         run_mode=state.get("run_mode", "resume"),
         next_queue_position=next_queue_position,
+        run_started_epoch=run_started_epoch,
     )
 
 
@@ -1676,6 +1837,17 @@ def build_ui():
                         lines=4,
                         value="Load a script and cache a voice prompt to begin.",
                     )
+                    with gr.Row():
+                        batch_elapsed_display = gr.Textbox(
+                            label="Elapsed Time",
+                            value="0.00 min",
+                            interactive=False,
+                        )
+                        batch_eta_display = gr.Textbox(
+                            label="ETA",
+                            value="ETA: waiting for first completed row",
+                            interactive=False,
+                        )
 
                 batch_script_upload.change(
                     load_batch_script,
@@ -1722,13 +1894,13 @@ def build_ui():
                 batch_generate_all_btn.click(
                     generate_all_batch_rows,
                     inputs=[batch_table, batch_output_folder, batch_language, batch_model_size, batch_ref_audio, batch_ref_text],
-                    outputs=[batch_table, batch_status, batch_prompt_status],
+                    outputs=[batch_table, batch_status, batch_prompt_status, batch_elapsed_display, batch_eta_display],
                 )
 
                 batch_generate_selected_btn.click(
                     generate_selected_batch_rows,
                     inputs=[batch_table, batch_output_folder, batch_language, batch_model_size, batch_ref_audio, batch_ref_text, batch_selected_rows],
-                    outputs=[batch_table, batch_status, batch_prompt_status],
+                    outputs=[batch_table, batch_status, batch_prompt_status, batch_elapsed_display, batch_eta_display],
                 )
 
                 batch_stop_btn.click(
@@ -1740,7 +1912,7 @@ def build_ui():
                 batch_resume_btn.click(
                     resume_batch_from_checkpoint,
                     inputs=[batch_output_folder],
-                    outputs=[batch_table, batch_status, batch_prompt_status],
+                    outputs=[batch_table, batch_status, batch_prompt_status, batch_elapsed_display, batch_eta_display],
                 )
 
             # --- Tab 5: About ---
